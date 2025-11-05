@@ -1,370 +1,236 @@
-# app.py
-import streamlit as st
-import pandas as pd
-import numpy as np
+"""
+Streamlit app: Blackjack assistant with a pre-trained model.
+"""
+
+import os
+from typing import List
+
+import altair as alt
 import joblib
-from io import BytesIO
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
+import pandas as pd
+import streamlit as st
 
-def _find_column_transformer(pipe: Pipeline) -> ColumnTransformer | None:
+from ml_components import (
+    RANKS,
+    VALUES,
+    hand_value,
+    BlackjackFeatureExtractor,  # noqa: F401
+    DropColumns,  # noqa: F401
+)
+
+DEALER_RANKS = [rank for rank in RANKS if rank not in {"J", "Q", "K"}]
+
+
+MODEL_PATH = "models/blackjack_action_model.joblib"
+
+
+st.set_page_config(page_title="Blackjack ML", page_icon=":spades:", layout="wide")
+
+st.markdown(
     """
-    Busca un ColumnTransformer dentro de un Pipeline (en cualquier step).
-    Devuelve el primero que encuentre o None si no hay.
-    """
-    if isinstance(pipe, ColumnTransformer):
-        return pipe
-    if hasattr(pipe, "named_steps"):
-        for _, step in pipe.named_steps.items():
-            # Puede estar directo o anidado
-            if isinstance(step, ColumnTransformer):
-                return step
-            if isinstance(step, Pipeline):
-                inner = _find_column_transformer(step)
-                if inner is not None:
-                    return inner
-    return None
-
-def expected_columns_from_ct(ct: ColumnTransformer) -> list[str]:
-    """
-    Extrae los nombres de columnas (strings) que el ColumnTransformer usó al fit.
-    Ignora transformadores 'drop' y los que usan índices/seleccionadores no-string.
-    """
-    cols = []
-    for name, trans, cols_spec in getattr(ct, "transformers_", []):
-        if cols_spec == "drop" or cols_spec is None:
-            continue
-        # Cuando se entrenó con nombres de columnas (strings), aquí quedan guardadas
-        if isinstance(cols_spec, (list, tuple)):
-            # Filtrar a solo strings (a veces aparecen índices)
-            cols.extend([c for c in cols_spec if isinstance(c, str)])
-    # Quitar duplicados preservando orden
-    seen = set()
-    unique_cols = []
-    for c in cols:
-        if c not in seen:
-            seen.add(c)
-            unique_cols.append(c)
-    return unique_cols
-
-def ensure_expected_columns(df: pd.DataFrame, expected: list[str]) -> pd.DataFrame:
-    """
-    Agrega al DataFrame toda columna faltante. Intenta poner defaults sensatos si
-    coincide con nombres típicos; caso contrario, NaN.
-    """
-    df = df.copy()
-    for col in expected:
-        if col not in df.columns:
-            # Defaults “inteligentes” para tu caso de Blackjack (ajustá si te conviene)
-            if col in ("player_cards", "dealer_cards"):
-                df[col] = ""
-            elif col in ("step", "round_id", "hand_number"):
-                df[col] = 1
-            elif col in ("game_id",):
-                df[col] = 0
-            elif col in ("bet_mode", "strategy_used"):
-                df[col] = "unknown"
-            else:
-                # Desconocida -> NaN
-                df[col] = np.nan
-    return df
-
-# ---------- Tipografía Poppins vía CSS ----------
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600&display=swap');
-html, body, [class*="css"]  {
-  font-family: 'Poppins', sans-serif;
-}
-</style>
-""", unsafe_allow_html=True)
-
-st.set_page_config(page_title="Blackjack ML – Demo", page_icon="🃏", layout="wide")
-
-# ---------- Transformadores que usaste en el notebook ----------
-from sklearn.base import BaseEstimator, TransformerMixin
-
-class DropColumns(BaseEstimator, TransformerMixin):
-    def __init__(self, columns_to_drop=None):
-        self.columns_to_drop = columns_to_drop or []
-    def fit(self, X, y=None):
-        return self
-    def transform(self, X):
-        return X.drop(columns=self.columns_to_drop)
-
-class BlackjackFeatureExtractor(BaseEstimator, TransformerMixin):
-    def fit(self, X, y=None):
-        return self
-    def transform(self, X):
-        X_ = X.copy()
-        # Valor óptimo de la mano del jugador (A=1 u 11)
-        def hand_value(cards):
-            card_list = [c.strip().upper() for c in str(cards).split(",") if c.strip()]
-            values = []
-            for c in card_list:
-                if c in ["J","Q","K"]:
-                    values.append(10)
-                elif c == "A":
-                    values.append(11)
-                else:
-                    try:
-                        values.append(int(c))
-                    except ValueError:
-                        values.append(0)
-            total = sum(values)
-            aces = card_list.count("A")
-            while total > 21 and aces > 0:
-                total -= 10
-                aces -= 1
-            return total
-
-        X_["player_total"] = X_["player_cards"].apply(hand_value)
-        X_["player_aces"]  = X_["player_cards"].apply(lambda s: str(s).upper().split(",").count("A"))
-
-        def dealer_value(cards):
-            first = str(cards).split(",")[0].strip().upper()
-            if first in ["J","Q","K"]:
-                return 10
-            elif first == "A":
-                return 11
-            else:
-                try:
-                    return int(first)
-                except ValueError:
-                    return 0
-        X_["dealer_visible"] = X_["dealer_cards"].apply(dealer_value)
-        return X_
-
-# ---------- Carga del modelo ----------
-@st.cache_resource
-def load_model():
-    m = joblib.load("models/blackjack_action_model.joblib")
-    # Intentamos descubrir columnas esperadas
-    ct = _find_column_transformer(m)
-    expected = expected_columns_from_ct(ct) if ct is not None else []
-    return m, expected
-
-model, expected_cols = load_model()
+    <style>
+    html, body, [class*="css"] { font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, sans-serif; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-# ---------- Utils ----------
-ACTIONS = ["hit","stand","double","split"]
+class HandState:
+    def __init__(self, cards: List[str], step: int = 1):
+        self.cards = [c.upper() for c in cards if c]
+        self.step = step
+        self.value = hand_value(",".join(self.cards)) if self.cards else 0
 
-def recommend_action(model, player_cards, dealer_cards, step=1, extra_cols=None):
-    """
-    Arma un DF con las columnas mínimas, lo completa con las esperadas por el
-    ColumnTransformer (si faltan), y predice.
-    """
-    row = {
-        "player_cards": player_cards,
-        "dealer_cards": dealer_cards,
-        "step": step,
-        # columnas comunes en tu dataset; si el DropColumns las quita, no pasa nada
-        "game_id": 1,
-        "round_id": 1,
-        "hand_number": 1,
-        "bet_mode": "flat",
-        "strategy_used": "unknown",
-    }
-    if extra_cols:
-        row.update(extra_cols)
+    def can_split(self) -> bool:
+        return len(self.cards) == 2 and self.cards[0] == self.cards[1]
 
-    X = pd.DataFrame([row])
+    def can_double(self) -> bool:
+        return self.step == 1
 
-    # Agregar columnas faltantes que el ColumnTransformer necesita
-    try:
-        # expected_cols viene del cache al cargar el modelo
-        if expected_cols:
-            X = ensure_expected_columns(X, expected_cols)
-        pred = model.predict(X)[0]
-        return pred
-    except ValueError as e:
-        # Si el ColumnTransformer igual se queja de “columns are missing”, lo mostramos claro
-        st.error("Faltan columnas para el pipeline. Revisá el mensaje y agregá defaults en ensure_expected_columns().")
-        st.code(str(e))
-        raise
 
-# Sencillo motor de Blackjack para la pestaña "Jugar"
-import random
-RANKS = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"]
-SUITS = ["♠","♥","♦","♣"]
+def basic_strategy(hand: HandState, dealer_up: str) -> str:
+    """Simplified basic strategy covering splits, soft totals, and hard totals."""
+    dealer_val = VALUES.get(dealer_up, 0)
+    if dealer_val == 0:
+        return "hit"
 
-def new_shoe(num_decks=4):
-    shoe = []
-    for _ in range(num_decks):
-        for r in RANKS:
-            for s in SUITS:
-                shoe.append((r,s))
-    random.shuffle(shoe)
-    return shoe
+    if hand.can_split():
+        rank = hand.cards[0]
+        if rank == "A":
+            return "split"
+        if rank == "10":
+            return "stand"
+        if rank == "9":
+            return "split" if (2 <= dealer_val <= 9 and dealer_val != 7) else "stand"
+        if rank == "8":
+            return "split"
+        if rank == "7":
+            return "split" if 2 <= dealer_val <= 7 else "hit"
+        if rank == "6":
+            return "split" if 2 <= dealer_val <= 6 else "hit"
+        if rank == "5":
+            return "double" if (2 <= dealer_val <= 9 and hand.can_double()) else "hit"
+        if rank == "4":
+            return "split" if 5 <= dealer_val <= 6 else "hit"
+        if rank in ("3", "2"):
+            return "split" if 2 <= dealer_val <= 7 else "hit"
 
-def card_to_str(card_tuple):
-    return card_tuple[0]
-
-def add_card(list_str, card_tuple):
-    s = card_to_str(card_tuple)
-    return (list_str + ", " + s) if list_str.strip() else s
-
-def hand_value(cards_str):
-    # igual a lo del extractor para coherencia
-    cards = [c.strip().upper() for c in cards_str.split(",") if c.strip()]
-    vals = []
-    for c in cards:
-        if c in ["J","Q","K"]:
-            vals.append(10)
-        elif c == "A":
-            vals.append(11)
+    total = 0
+    aces = 0
+    for card in hand.cards:
+        if card == "A":
+            total += 11
+            aces += 1
         else:
-            try: vals.append(int(c))
-            except: vals.append(0)
-    total = sum(vals)
-    aces = cards.count("A")
+            total += VALUES.get(card, 0)
     while total > 21 and aces > 0:
         total -= 10
         aces -= 1
-    return total
+    is_soft = aces > 0 and total == hand.value and hand.value <= 21
 
-# ---------- Sidebar ----------
-st.sidebar.title("🃏 Blackjack ML – Demo")
-st.sidebar.write("Explorá los datos, mirá resultados del modelo y jugá contra la política aprendida.")
-num_decks = st.sidebar.selectbox("N° de mazos", [1,2,4,6,8], index=2)
+    if is_soft:
+        if hand.value == 20:
+            return "stand"
+        if hand.value == 19:
+            return "double" if dealer_val == 6 and hand.can_double() else "stand"
+        if hand.value == 18:
+            if 2 <= dealer_val <= 6 and hand.can_double():
+                return "double"
+            if 9 <= dealer_val <= 11:
+                return "hit"
+            return "stand"
+        if hand.value == 17:
+            return "double" if 3 <= dealer_val <= 6 and hand.can_double() else "hit"
+        if hand.value in (15, 16):
+            return "double" if 4 <= dealer_val <= 6 and hand.can_double() else "hit"
+        if hand.value in (13, 14):
+            return "double" if 5 <= dealer_val <= 6 and hand.can_double() else "hit"
 
-# ---------- State para la pestaña de juego ----------
-if "shoe" not in st.session_state:
-    st.session_state.shoe = new_shoe(num_decks)
-if "player_cards" not in st.session_state:
-    st.session_state.player_cards = ""
-if "dealer_cards" not in st.session_state:
-    st.session_state.dealer_cards = ""
-if "step" not in st.session_state:
-    st.session_state.step = 1
-if "round_over" not in st.session_state:
-    st.session_state.round_over = True
+    if hand.value >= 17:
+        return "stand"
+    if 13 <= hand.value <= 16:
+        return "stand" if dealer_val < 7 else "hit"
+    if hand.value == 12:
+        return "stand" if 4 <= dealer_val <= 6 else "hit"
+    if hand.value == 11:
+        return "double" if hand.can_double() else "hit"
+    if hand.value == 10:
+        return "double" if dealer_val <= 9 and hand.can_double() else "hit"
+    if hand.value == 9:
+        return "double" if 3 <= dealer_val <= 6 and hand.can_double() else "hit"
+    return "hit"
 
-# ---------- Tabs ----------
-tab1, tab2, tab3 = st.tabs(["📊 Exploración", "✅ Resultados del modelo", "🎮 Jugar vs el modelo"])
 
-# === Tab 1: Exploración ===
-with tab1:
-    st.subheader("Exploración del dataset")
-    default_file = "data/Simulacion_BJ.csv"
-    uploaded = st.file_uploader("Subí tu CSV (opcional). Si no, intento cargar data/Simulacion_BJ.csv", type=["csv"])
-    try:
-        if uploaded:
-            df = pd.read_csv(uploaded)
-        else:
-            df = pd.read_csv(default_file)
-        st.write("Vista rápida:")
-        st.dataframe(df.head(50), use_container_width=True)
+@st.cache_resource(show_spinner=False)
+def load_model(path: str):
+    if os.path.exists(path):
+        return joblib.load(path)
+    return None
 
-        # Filtros básicos
-        cols = st.multiselect("Columnas a mostrar", df.columns.tolist(), default=df.columns.tolist()[:10])
-        st.dataframe(df[cols].head(200), use_container_width=True)
 
-        # Conteo de acciones si existe 'action'
-        if "action" in df.columns:
-            st.write("Distribución de acciones:")
-            st.bar_chart(df["action"].value_counts())
-    except Exception as e:
-        st.info("No se pudo cargar un dataset por defecto. Subí uno arriba.")
-        st.caption(str(e))
+st.title("Blackjack ML - Jugar con modelo pre-entrenado")
+st.caption("Esta version de la app carga automaticamente `models/blackjack_action_model.joblib` y permite jugar directamente.")
 
-# === Tab 2: Resultados ===
-with tab2:
-    st.subheader("Aplicar el modelo y revisar resultados")
-    st.write("Podés pasar tu dataset por el pipeline y ver las acciones predichas.")
-    data_file = st.file_uploader("Dataset para predecir", type=["csv"], key="pred_uploader")
+model = load_model(MODEL_PATH)
 
-    if data_file:
-        dfx = pd.read_csv(data_file)
+if model is None:
+    st.error(f"No se encontro el archivo `{MODEL_PATH}`. Coloca el modelo entrenado en esa ruta y recarga la app.")
+    st.stop()
+
+st.success("Modelo cargado correctamente. Listo para jugar!")
+
+tab_play, tab_heatmap = st.tabs(["Jugar", "Heatmap"])
+
+with tab_play:
+    st.subheader("Ingresa tu mano")
+    col_cards, col_dealer, col_step = st.columns([2, 1, 1])
+    with col_cards:
+        player_cards_input = st.text_input("Tus cartas (ej: `A,7` o `10,6,2`)", value="A,7")
+    with col_dealer:
+        dealer_up = st.selectbox("Carta visible del dealer", DEALER_RANKS, index=DEALER_RANKS.index("6"))
+    with col_step:
+        step = st.number_input("Paso (1 permite `double`)", min_value=1, value=1, step=1)
+
+    cleaned_cards = [c.strip().upper() for c in player_cards_input.split(",") if c.strip()]
+    player_cards_csv = ",".join(cleaned_cards)
+
+    invalid_faces = [c for c in cleaned_cards if c in {"J", "Q", "K"}]
+
+    if invalid_faces:
+        st.error("Ingresa cartas de figura como 10 antes de consultar al modelo.")
+    elif not cleaned_cards:
+        st.info("Ingresa al menos una carta para consultar al modelo.")
+    else:
+        base_row = {
+            "player_cards": player_cards_csv,
+            "player_cards_step": player_cards_csv,
+            "dealer_cards": dealer_up,
+            "dealer_visible_card": dealer_up,
+            "actions": "",
+            "step": step,
+            "player_total": hand_value(player_cards_csv),
+            "cards_remaining": 0,
+            "decks_remaining": 0,
+            "running_count_end": 0,
+            "true_count_end": 0,
+            "true_count_prev_round": 0,
+            "bet_amount": 0,
+            "final_result": "",
+        }
+
+        features = pd.DataFrame([base_row])
+
         try:
-            preds = model.predict(dfx)
-            dfx_out = dfx.copy()
-            dfx_out["predicted_action"] = preds
-            st.success(f"OK. Filas: {len(dfx_out)}")
-            st.dataframe(dfx_out.head(200), use_container_width=True)
-
-            # Descarga
-            buffer = BytesIO()
-            dfx_out.to_csv(buffer, index=False)
-            st.download_button("Descargar CSV con predicciones", data=buffer.getvalue(),
-                               file_name="predicciones_blackjack.csv", mime="text/csv")
-        except Exception as e:
-            st.error("El dataset no tiene las columnas esperadas para el pipeline.")
-            st.code(str(e))
-
-    st.caption("Recordá que tu pipeline internamente calcula features como player_total, player_aces y dealer_visible, y descarta columnas no usadas.")
-
-# === Tab 3: Jugar vs el modelo ===
-with tab3:
-    st.subheader("Simulador de mano – consulta al modelo")
-    colA, colB = st.columns(2)
-    with colA:
-        if st.session_state.round_over:
-            if st.button("🂠 Repartir"):
-                st.session_state.shoe = new_shoe(num_decks)
-                st.session_state.player_cards = ""
-                st.session_state.dealer_cards = ""
-                st.session_state.step = 1
-                st.session_state.round_over = False
-
-                # Dar 2 al jugador y 2 al dealer
-                for _ in range(2):
-                    st.session_state.player_cards = add_card(st.session_state.player_cards, st.session_state.shoe.pop())
-                    st.session_state.dealer_cards = add_card(st.session_state.dealer_cards, st.session_state.shoe.pop())
+            prediction = model.predict(features)[0]
+            st.markdown(f"### El modelo sugiere: **{prediction}**")
+        except Exception as exc:
+            st.error(f"No se pudo obtener una prediccion del modelo: {exc}")
         else:
-            st.write("**Tus cartas**:", st.session_state.player_cards, " | Total:", hand_value(st.session_state.player_cards))
-            st.write("**Dealer (visible)**:", st.session_state.dealer_cards.split(",")[0])
+            hand = HandState(cleaned_cards, step=step)
+            basic_move = basic_strategy(hand, dealer_up)
+            st.caption(f"Estrategia basica recomienda: {basic_move}")
 
-            c1, c2, c3 = st.columns(3)
-            if c1.button("🤖 Recomendar acción"):
-                rec = recommend_action(
-                    model,
-                    st.session_state.player_cards,
-                    st.session_state.dealer_cards,
-                    step=st.session_state.step
-                )
-                st.toast(f"Modelo sugiere: {rec.upper()}")
-                st.session_state.last_rec = rec
+            with st.expander("Ver datos utilizados para la prediccion"):
+                st.dataframe(features, use_container_width=True)
 
-            # Aplicar acción (simple): hit / stand
-            rec_to_apply = st.selectbox("Acción a aplicar", ACTIONS, index=ACTIONS.index(st.session_state.get("last_rec","hit")))
-            if c2.button("Aplicar acción"):
-                if rec_to_apply == "hit" or rec_to_apply == "double":
-                    # (si es double no duplicamos apuesta aquí; el objetivo es didáctico)
-                    st.session_state.player_cards = add_card(st.session_state.player_cards, st.session_state.shoe.pop())
-                    st.session_state.step += 1
-                    if hand_value(st.session_state.player_cards) > 21:
-                        st.error("¡Te pasaste! Pierdes la mano.")
-                        st.session_state.round_over = True
-                elif rec_to_apply == "stand":
-                    # "Jugar" dealer hasta 17+
-                    def dealer_total(cards_str):
-                        return hand_value(cards_str)
-                    while dealer_total(st.session_state.dealer_cards) < 17 and len(st.session_state.shoe) > 0:
-                        st.session_state.dealer_cards = add_card(st.session_state.dealer_cards, st.session_state.shoe.pop())
+with tab_heatmap:
+    st.subheader("Heatmap de acciones recomendadas")
+    st.caption("El modelo se consulta para cada combinacion de total del jugador y carta visible del dealer.")
 
-                    # Resultado
-                    p = hand_value(st.session_state.player_cards)
-                    d = hand_value(st.session_state.dealer_cards)
-                    st.write(f"Dealer: {st.session_state.dealer_cards} (total {d})")
-                    if d > 21 or p > d:
-                        st.success("¡Ganaste!")
-                    elif p < d:
-                        st.error("Perdiste 😢")
-                    else:
-                        st.info("Empate (push).")
-                    st.session_state.round_over = True
-                elif rec_to_apply == "split":
-                    st.info("Split no está implementado en esta versión demo (mecánica de múltiples manos).")
+    total_range = st.slider("Rango de totales del jugador", 4, 21, (5, 20))
+    totals = list(range(total_range[0], total_range[1] + 1))
 
-            if c3.button("🔄 Nueva mano"):
-                st.session_state.round_over = True
+    grid = pd.DataFrame(
+        [(total, dealer) for total in totals for dealer in DEALER_RANKS],
+        columns=["player_total", "dealer_visible_card"],
+    )
 
-    with colB:
-        st.caption("Vista rápida del estado")
-        st.metric("Paso", st.session_state.step)
-        st.write("Jugador:", st.session_state.player_cards, " | Total:", hand_value(st.session_state.player_cards) if st.session_state.player_cards else "-")
-        st.write("Dealer:", st.session_state.dealer_cards, " | Visible:", st.session_state.dealer_cards.split(",")[0] if st.session_state.dealer_cards else "-")
-        if "last_rec" in st.session_state:
-            st.write("Última recomendación del modelo:", st.session_state.last_rec.upper())
+    try:
+        grid["pred_action"] = model.predict(grid[["player_total", "dealer_visible_card"]])
+    except Exception as exc:
+        st.error(f"No se pudo generar el heatmap: {exc}")
+    else:
+        action_palette = {"hit": "#2196F3", "stand": "#4CAF50"}
+        chart = (
+            alt.Chart(grid)
+            .mark_rect()
+            .encode(
+                x=alt.X("dealer_visible_card:N", title="Carta visible del dealer", sort=DEALER_RANKS),
+                y=alt.Y("player_total:O", title="Suma de cartas del jugador", sort=totals),
+                color=alt.Color(
+                    "pred_action:N",
+                    title="Accion recomendada",
+                    scale=alt.Scale(
+                        domain=list(action_palette.keys()),
+                        range=list(action_palette.values()),
+                    ),
+                ),
+                tooltip=["player_total", "dealer_visible_card", "pred_action"],
+            )
+            .properties(height=500)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+        with st.expander("Ver datos del heatmap"):
+            st.dataframe(grid, use_container_width=True)
