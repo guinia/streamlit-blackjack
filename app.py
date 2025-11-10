@@ -5,7 +5,7 @@ Streamlit app: asistente de Blackjack con modelo pre-entrenado.
 import itertools
 import os
 import random
-from typing import List
+from typing import Callable, Dict, List, Optional, Tuple
 
 import altair as alt
 import joblib
@@ -81,6 +81,12 @@ class HandState:
         return self.step == 1
 
 
+SUITS = ["♠", "♥", "♦", "♣"]
+DISPLAY_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+FACE_TO_MODEL = {"J": "10", "Q": "10", "K": "10"}
+MAX_SPLITS = 1
+
+
 def basic_strategy(hand: HandState, dealer_up: str) -> str:
     """Simplified basic strategy covering splits, soft totals, and hard totals."""
     dealer_val = VALUES.get(dealer_up, 0)
@@ -154,9 +160,244 @@ def basic_strategy(hand: HandState, dealer_up: str) -> str:
     return "hit"
 
 
-SUITS = ["♠", "♥", "♦", "♣"]
-DISPLAY_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
-FACE_TO_MODEL = {"J": "10", "Q": "10", "K": "10"}
+def _hand_total_from_cards(cards: List[str]) -> int:
+    total = 0
+    aces = 0
+    for card in cards:
+        if card == "A":
+            total += 11
+            aces += 1
+        else:
+            total += VALUES.get(card, 0)
+    while total > 21 and aces > 0:
+        total -= 10
+        aces -= 1
+    return total
+
+
+def _normalize_action(action: str) -> str:
+    action = (action or "").strip().lower()
+    if action in {"hit", "stand", "double", "split"}:
+        return action
+    return "hit"
+
+
+def _build_sim_shoe(num_decks: int, rng: random.Random) -> List[str]:
+    deck: List[str] = []
+    for _ in range(num_decks):
+        for rank in RANKS:
+            normalized = FACE_TO_MODEL.get(rank, rank)
+            deck.extend([normalized] * 4)
+    rng.shuffle(deck)
+    return deck
+
+
+def _draw_from_shoe(shoe: List[str], rng: random.Random, num_decks: int) -> str:
+    if not shoe:
+        shoe.extend(_build_sim_shoe(num_decks, rng))
+    return shoe.pop()
+
+
+def generate_round_scripts(
+    num_rounds: int,
+    seed: int,
+    num_decks: int = 6,
+    max_player_cards: int = 16,
+    max_dealer_cards: int = 12,
+) -> List[Dict[str, List[str]]]:
+    rng = random.Random(int(seed))
+    shoe = _build_sim_shoe(num_decks, rng)
+    scripts: List[Dict[str, List[str]]] = []
+    for _ in range(num_rounds):
+        needed = max_player_cards + max_dealer_cards
+        if len(shoe) < needed:
+            shoe.extend(_build_sim_shoe(num_decks, rng))
+        player_seq = [_draw_from_shoe(shoe, rng, num_decks) for _ in range(max_player_cards)]
+        dealer_seq = [_draw_from_shoe(shoe, rng, num_decks) for _ in range(max_dealer_cards)]
+        scripts.append({"player_seq": player_seq, "dealer_seq": dealer_seq})
+    return scripts
+
+
+def simulate_round_from_script(
+    script: Dict[str, List[str]],
+    strategy_fn: Callable[[HandState, str], str],
+    *,
+    allow_split: bool = False,
+    allow_double: bool = False,
+) -> List[Dict[str, float]]:
+    player_seq = script.get("player_seq", [])
+    dealer_seq = script.get("dealer_seq", [])
+    if len(player_seq) < 2 or len(dealer_seq) < 2:
+        return [{"result": "push", "bet_mult": 1.0}]
+
+    dealer_cards = list(dealer_seq[:2])
+    dealer_idx = 2
+    player_idx = 2
+
+    def draw_player_card() -> Optional[str]:
+        nonlocal player_idx
+        if player_idx >= len(player_seq):
+            return None
+        card = player_seq[player_idx]
+        player_idx += 1
+        return card
+
+    hands_queue: List[Dict[str, float]] = [
+        {
+            "cards": [player_seq[0], player_seq[1]],
+            "bet_mult": 1.0,
+            "step": 1,
+            "split_depth": 0,
+        }
+    ]
+    final_hands: List[Dict[str, float]] = []
+
+    while hands_queue:
+        state = hands_queue.pop(0)
+        while True:
+            hand_obj = HandState(list(state["cards"]), step=int(state["step"]))
+            dealer_up = dealer_cards[0]
+            action = _normalize_action(strategy_fn(hand_obj, dealer_up))
+
+            if action == "split":
+                if not allow_split:
+                    action = "hit"
+                    continue
+                can_split = hand_obj.can_split() and state["split_depth"] < MAX_SPLITS
+                if can_split:
+                    next_a = draw_player_card()
+                    next_b = draw_player_card()
+                    if next_a is None or next_b is None:
+                        action = "stand"
+                    else:
+                        hand_a = {
+                            "cards": [state["cards"][0], next_a],
+                            "bet_mult": state["bet_mult"],
+                            "step": 1,
+                            "split_depth": state["split_depth"] + 1,
+                        }
+                        hand_b = {
+                            "cards": [state["cards"][1], next_b],
+                            "bet_mult": state["bet_mult"],
+                            "step": 1,
+                            "split_depth": state["split_depth"] + 1,
+                        }
+                        hands_queue.insert(0, hand_b)
+                        hands_queue.insert(0, hand_a)
+                        break
+                else:
+                    action = "hit"
+
+            if action == "double":
+                if not allow_double:
+                    action = "hit"
+                    continue
+                if not hand_obj.can_double():
+                    action = "hit"
+                    continue
+                next_card = draw_player_card()
+                if next_card is None:
+                    action = "stand"
+                    continue
+                state["cards"].append(next_card)
+                state["step"] += 1
+                state["bet_mult"] *= 2
+                busted = _hand_total_from_cards(state["cards"]) > 21
+                final_hands.append(
+                    {"cards": list(state["cards"]), "bet_mult": state["bet_mult"], "busted": busted}
+                )
+                break
+
+            if action == "hit":
+                next_card = draw_player_card()
+                if next_card is None:
+                    action = "stand"
+                else:
+                    state["cards"].append(next_card)
+                    state["step"] += 1
+                    if _hand_total_from_cards(state["cards"]) > 21:
+                        final_hands.append(
+                            {"cards": list(state["cards"]), "bet_mult": state["bet_mult"], "busted": True}
+                        )
+                        break
+                    continue
+
+            final_hands.append(
+                {"cards": list(state["cards"]), "bet_mult": state["bet_mult"], "busted": False}
+            )
+            break
+
+
+    dealer_total = _hand_total_from_cards(dealer_cards)
+    while dealer_total < 17:
+        if dealer_idx >= len(dealer_seq):
+            break
+        dealer_cards.append(dealer_seq[dealer_idx])
+        dealer_idx += 1
+        dealer_total = _hand_total_from_cards(dealer_cards)
+
+    outcomes: List[Dict[str, float]] = []
+    for hand in final_hands or [{"cards": [], "bet_mult": 1.0, "busted": False}]:
+        bet_mult = float(hand.get("bet_mult", 1.0))
+        if hand.get("busted"):
+            outcomes.append({"result": "lose", "bet_mult": bet_mult})
+            continue
+        player_total = _hand_total_from_cards(hand.get("cards", []))
+        if player_total > 21:
+            outcomes.append({"result": "lose", "bet_mult": bet_mult})
+            continue
+        if dealer_total > 21:
+            outcomes.append({"result": "win", "bet_mult": bet_mult})
+        elif player_total > dealer_total:
+            outcomes.append({"result": "win", "bet_mult": bet_mult})
+        elif player_total < dealer_total:
+            outcomes.append({"result": "lose", "bet_mult": bet_mult})
+        else:
+            outcomes.append({"result": "push", "bet_mult": bet_mult})
+
+    return outcomes
+
+
+def simulate_bankroll_from_scripts(
+    scripts: List[Dict[str, List[str]]],
+    bet_amount: float,
+    initial_bankroll: float,
+    strategy_fn: Callable[[HandState, str], str],
+    *,
+    allow_split: bool = False,
+    allow_double: bool = False,
+) -> Tuple[List[float], Dict[str, float]]:
+    bankroll = float(initial_bankroll)
+    history = [bankroll]
+    stats = {"win": 0, "lose": 0, "push": 0}
+
+    for script in scripts:
+        if bankroll <= 0:
+            break
+        outcomes = simulate_round_from_script(
+            script,
+            strategy_fn,
+            allow_split=allow_split,
+            allow_double=allow_double,
+        )
+        for outcome in outcomes:
+            if bankroll <= 0:
+                break
+            result = outcome.get("result", "push")
+            bet_mult = float(outcome.get("bet_mult", 1.0))
+            if result not in stats:
+                result = "push"
+            stats[result] += 1
+            if result == "win":
+                bankroll += bet_amount * bet_mult
+            elif result == "lose":
+                bankroll -= bet_amount * bet_mult
+            bankroll = max(bankroll, 0.0)
+            history.append(bankroll)
+
+    stats["hands"] = sum(stats.values())
+    stats["final_bankroll"] = bankroll
+    return history, stats
 
 
 def build_shoe(num_decks: int) -> List[dict]:
@@ -400,7 +641,46 @@ if (
 ):
     update_recommendations()
 
-tab_play, tab_heatmap = st.tabs(["Jugar", "Heatmap"])
+tab_home, tab_play, tab_comparacion, tab_sim = st.tabs(["Home", "Jugar", "Comparación", "Simulacion"])
+
+with tab_home:
+    st.header("Introducción")
+    st.markdown(
+        """
+        Bienvenido a la aplicación *Blackjack ML*. Aquí resumimos cómo usar cada pestaña, por qué construimos la herramienta y la lógica que hay detrás del juego interactivo, del análisis visual y de la simulación que enfrenta al modelo contra la estrategia básica.
+        """
+    )
+
+    st.subheader("¿Cómo se usa la app?")
+    st.markdown(
+        """
+        - **Jugar:** selecciona el número de mazos, reparte una mano con **Nueva mano** y sigue pidiendo (**Hit**) o plantándote (**Stand**) mientras comparas la recomendación del modelo y la de la estrategia básica. Puedes resetear el zapato para barajar de nuevo.
+        - **Heatmap / Comparación:** explora cómo el modelo decide para cada total del jugador y carta visible del dealer, revisa la matriz de confusión y los totales con mayor desacuerdo contra la estrategia básica.
+        - **Simulación:** define capital inicial, apuesta fija, número de manos, cantidad de mazos y seed. La app simula exactamente las mismas manos para ambas estrategias y dibuja la evolución del bankroll, además de mostrar cuántas manos ganó o perdió cada enfoque.
+        """
+    )
+
+    st.subheader("¿Para qué la hicimos?")
+    st.markdown(
+        """
+        Queremos contrastar un modelo de machine learning (limitado a elegir entre *hit* y *stand*) contra la estrategia básica clásica. Las pestañas permiten:
+        - Experimentar mano a mano de forma interactiva.
+        - Ver cómo cambian las recomendaciones en todo el espacio de estados mediante visualizaciones.
+        - Medir el desempeño acumulado de cada estrategia con simulaciones controladas que comparten la misma semilla, apostando un monto fijo hasta que se agota el bankroll o se cumplen las manos configuradas.
+        """
+    )
+
+    st.subheader("¿Cómo funciona?")
+    st.markdown(
+        """
+        - El modelo se carga desde `models/blackjack_action_model.joblib` .
+        - Para generar una recomendación el modelo recibe dos características principales: la suma actual del jugador (*player_total*) y la carta visible del dealer (*dealer_visible_card*).
+        - Además de la recomendación del modelo, la app implementa una función de *estrategia básica* (reglas codificadas) que devuelve la acción que la estrategia clásica sugiere.
+        - En la pestaña *Heatmap* se generan recomendaciones del modelo para rangos de totales y cartas del dealer para facilitar comparación visual.
+        - La pestaña *Simulación* crea secuencias de cartas pseudoaleatorias con una seed compartida. Se juegan dos recorridos sobre las mismas manos: uno siguiendo la estrategia básica (que puede doblar y dividir) y otro usando exclusivamente las decisiones del modelo. Cada mano agrega o resta la apuesta correspondiente (duplicada cuando se dobla), lo cual nos permite comparar la evolución del capital.
+        """
+    )
+
 
 with tab_play:
     st.subheader("Mesa de juego")
@@ -423,7 +703,7 @@ with tab_play:
         if st.button("Plantarse (Stand)", use_container_width=True, disabled=st.session_state.round_over):
             player_stand_action()
     with control_cols[3]:
-        if st.button("Reset zapato", use_container_width=True):
+        if st.button("Reset mazo", use_container_width=True):
             st.session_state.shoe = build_shoe(st.session_state.num_decks)
             reset_round_state()
 
@@ -471,9 +751,10 @@ with tab_play:
             st.info("Modelo listo para sugerir cuando inicie la mano.")
     with rec_cols[1]:
         if st.session_state.last_basic:
-            st.caption(f"Estrategia básica: {st.session_state.last_basic}")
+            # Mostrar la estrategia básica dentro de un recuadro de color (info)
+            st.info(f"Estrategia básica: {st.session_state.last_basic}")
         else:
-            st.caption("Estrategia básica disponible cuando haya cartas.")
+            st.info("Estrategia básica disponible cuando haya cartas.")
 
     if st.session_state.result_text:
         st.write("")
@@ -481,7 +762,7 @@ with tab_play:
     elif st.session_state.round_over and not st.session_state.player_cards_values:
         st.info("Presiona *Nueva mano* para comenzar una ronda.")
 
-with tab_heatmap:
+with tab_comparacion:
     st.subheader("Heatmap de acciones recomendadas")
     st.caption("Se consulta al modelo para cada combinacion de total del jugador y carta visible del dealer.")
 
@@ -493,14 +774,31 @@ with tab_heatmap:
         columns=["player_total", "dealer_visible_card"],
     )
 
+    features_grid = grid[["player_total", "dealer_visible_card"]]
     try:
-        grid["pred_action"] = model.predict(grid[["player_total", "dealer_visible_card"]])
+        grid["pred_action"] = model.predict(features_grid)
+        grid["pred_confidence"] = None
+        has_confidence = False
+        if hasattr(model, "predict_proba"):
+            prob_matrix = model.predict_proba(features_grid)
+            prob_df = pd.DataFrame(prob_matrix, columns=model.classes_)
+            confidences = []
+            available_cols = set(prob_df.columns)
+            for idx, action in enumerate(grid["pred_action"]):
+                if action in available_cols:
+                    confidences.append(float(prob_df.iloc[idx][action]))
+                else:
+                    confidences.append(float("nan"))
+            grid["pred_confidence"] = pd.Series(confidences, dtype=float)
+            has_confidence = pd.notna(grid["pred_confidence"]).any()
+        else:
+            grid["pred_confidence"] = float("nan")
     except Exception as exc:
         st.error(f"No se pudo generar el heatmap: {exc}")
     else:
-        action_palette = {"hit": "#4CAF50", "stand": "#2196F3"}
         chart_height = max(300, min(len(totals) * 35, 900))
-        chart_heatmap = (
+        action_palette = {"hit": "#4CAF50", "stand": "#2196F3"}
+        heatmap = (
             alt.Chart(grid)
             .mark_rect()
             .encode(
@@ -516,10 +814,27 @@ with tab_heatmap:
                     title="Accion recomendada",
                     scale=alt.Scale(domain=list(action_palette.keys()), range=list(action_palette.values())),
                 ),
-                tooltip=["player_total", "dealer_visible_card", "pred_action"],
             )
             .properties(height=chart_height)
         )
+
+        if has_confidence:
+            heatmap = heatmap.encode(
+                tooltip=[alt.Tooltip("pred_confidence:Q", title="Confianza", format=".0%")]
+            )
+            text_layer = (
+                alt.Chart(grid)
+                .mark_text(color="white", fontSize=12, fontWeight="bold")
+                .encode(
+                    x=alt.X("dealer_visible_card:N", sort=DEALER_RANKS),
+                    y=alt.Y("player_total:O", sort=totals),
+                    text=alt.Text("pred_confidence:Q", format=".0%"),
+                )
+            )
+            chart_heatmap = heatmap + text_layer
+        else:
+            chart_heatmap = heatmap
+
         st.altair_chart(chart_heatmap, use_container_width=True)
 
         with st.expander("Ver datos del heatmap"):
@@ -590,6 +905,7 @@ with tab_heatmap:
                 .reset_index()
             )
             summary["disagree_rate"] = 1 - summary["agree_sum"] / summary["total"]
+            summary = summary[summary["disagree_rate"] > 0].reset_index(drop=True)
             top_disagree = summary.sort_values("disagree_rate", ascending=False).head(12)
 
             chart_disagree = (
@@ -599,7 +915,7 @@ with tab_heatmap:
                     x=alt.X("disagree_rate:Q", title="Tasa de desacuerdo", axis=alt.Axis(format=".0%")),
                     y=alt.Y(
                         "player_total:O",
-                        sort="-x",
+                        sort="x",
                         title="Suma del jugador",
                         axis=alt.Axis(labelAngle=0),
                     ),
@@ -626,3 +942,105 @@ with tab_heatmap:
                 st.dataframe(df_hands.head(200), use_container_width=True)
         except Exception as exc:
             st.error(f"No se pudo generar el analisis de acuerdo: {exc}")
+
+with tab_sim:
+    st.subheader("Simulacion de bankroll")
+    st.caption("Compara capital restante aplicando estrategia basica vs el modelo usando manos sinteticas generadas con la misma semilla.")
+
+    with st.form("sim_form"):
+        initial_bankroll = st.number_input("Capital inicial ($)", min_value=10.0, value=200.0, step=10.0)
+        bet_amount = st.number_input("Apuesta fija por mano ($)", min_value=1.0, value=10.0, step=1.0)
+        max_hands = st.slider("Manos maximas por simulacion", 20, 1000, 200, step=20)
+        sim_decks = st.selectbox("Mazos para la simulacion", options=[1, 2, 4, 6, 8], index=3)
+        seed_value = st.number_input("Seed aleatoria", min_value=0, max_value=999999, value=123, step=1)
+        submitted = st.form_submit_button("Ejecutar simulacion")
+
+    if submitted:
+        if bet_amount > initial_bankroll:
+            st.error("La apuesta debe ser menor o igual al capital inicial.")
+        else:
+            scripts = generate_round_scripts(
+                num_rounds=max_hands,
+                seed=int(seed_value),
+                num_decks=int(sim_decks),
+            )
+
+            def basic_decider(hand: HandState, dealer_up: str) -> str:
+                return basic_strategy(hand, dealer_up)
+
+            def model_decider(hand: HandState, dealer_up: str) -> str:
+                features = pd.DataFrame(
+                    {"player_total": [hand.value], "dealer_visible_card": [dealer_up]}
+                )
+                return model.predict(features)[0]
+
+            hist_basic, stats_basic = simulate_bankroll_from_scripts(
+                scripts,
+                bet_amount,
+                initial_bankroll,
+                basic_decider,
+                allow_split=True,
+                allow_double=True,
+            )
+            hist_model, stats_model = simulate_bankroll_from_scripts(
+                scripts,
+                bet_amount,
+                initial_bankroll,
+                model_decider,
+                allow_split=False,
+                allow_double=False,
+            )
+
+            history_frames = []
+            for label, history in [
+                ("Estrategia basica", hist_basic),
+                ("Modelo ML", hist_model),
+            ]:
+                history_frames.append(
+                    pd.DataFrame(
+                        {
+                            "mano": list(range(len(history))),
+                            "bankroll": history,
+                            "estrategia": label,
+                        }
+                    )
+                )
+            plot_df = pd.concat(history_frames, ignore_index=True)
+
+            chart_sim = (
+                alt.Chart(plot_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("mano:Q", title="Mano simulada"),
+                    y=alt.Y("bankroll:Q", title="Capital ($)"),
+                    color=alt.Color("estrategia:N", title="Estrategia"),
+                )
+                .properties(height=420)
+            )
+            st.altair_chart(chart_sim, use_container_width=True)
+
+            stats_df = pd.DataFrame(
+                [
+                    {
+                        "Estrategia": "Estrategia basica",
+                        "Manos": stats_basic.get("hands", 0),
+                        "Ganadas": stats_basic.get("win", 0),
+                        "Perdidas": stats_basic.get("lose", 0),
+                        "Push": stats_basic.get("push", 0),
+                        "Capital final": stats_basic.get("final_bankroll", 0.0),
+                    },
+                    {
+                        "Estrategia": "Modelo ML",
+                        "Manos": stats_model.get("hands", 0),
+                        "Ganadas": stats_model.get("win", 0),
+                        "Perdidas": stats_model.get("lose", 0),
+                        "Push": stats_model.get("push", 0),
+                        "Capital final": stats_model.get("final_bankroll", 0.0),
+                    },
+                ]
+            )
+            st.dataframe(stats_df.set_index("Estrategia"), use_container_width=True)
+
+            st.caption(
+                "La simulacion se detiene cuando el capital llega a $0 o cuando se alcanzan las manos configuradas."
+            )
