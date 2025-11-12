@@ -11,6 +11,7 @@ import altair as alt
 import joblib
 import pandas as pd
 import streamlit as st
+from pathlib import Path
 
 from ml_components import (
     RANKS,
@@ -24,6 +25,8 @@ from ml_components import (
 
 MODEL_PATH = "models/blackjack_action_model.joblib"
 DEALER_RANKS = [rank for rank in RANKS if rank not in {"J", "Q", "K"}]
+DEALER_RANKS = [rank for rank in DEALER_RANKS if rank not in {"10", "A"}] + ["10", "A"]
+STRATEGY_CHART_PATH = Path(__file__).resolve().parent / "mini-blackjack-strategy-chart.png"
 
 
 st.set_page_config(page_title="Blackjack ML", page_icon=":spades:", layout="wide")
@@ -768,6 +771,7 @@ with tab_comparacion:
 
     total_range = st.slider("Rango de totales del jugador", 4, 21, (5, 20))
     totals = list(range(total_range[0], total_range[1] + 1))
+    player_total_order = list(reversed(totals))
 
     grid = pd.DataFrame(
         [(total, dealer) for total in totals for dealer in DEALER_RANKS],
@@ -806,7 +810,7 @@ with tab_comparacion:
                 y=alt.Y(
                     "player_total:O",
                     title="Suma de cartas del jugador",
-                    sort=totals,
+                    sort=player_total_order,
                     axis=alt.Axis(labelAngle=0),
                 ),
                 color=alt.Color(
@@ -827,7 +831,7 @@ with tab_comparacion:
                 .mark_text(color="white", fontSize=12, fontWeight="bold")
                 .encode(
                     x=alt.X("dealer_visible_card:N", sort=DEALER_RANKS),
-                    y=alt.Y("player_total:O", sort=totals),
+                    y=alt.Y("player_total:O", sort=player_total_order),
                     text=alt.Text("pred_confidence:Q", format=".0%"),
                 )
             )
@@ -835,7 +839,18 @@ with tab_comparacion:
         else:
             chart_heatmap = heatmap
 
-        st.altair_chart(chart_heatmap, use_container_width=True)
+        heatmap_col, image_col = st.columns([3, 2], vertical_alignment="center")
+        with heatmap_col:
+            st.altair_chart(chart_heatmap, use_container_width=True)
+        with image_col:
+            if STRATEGY_CHART_PATH.exists():
+                st.image(
+                    str(STRATEGY_CHART_PATH),
+                    caption="Tabla de estrategia básica",
+                    use_container_width=True,
+                )
+            else:
+                st.info("Agrega mini-blackjack-strategy-chart.png al directorio base para comparar visualmente.")
 
         with st.expander("Ver datos del heatmap"):
             st.dataframe(grid, use_container_width=True)
